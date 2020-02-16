@@ -15,6 +15,7 @@ Private Const MEM_RELEASE             As Long = &H8000&
 Private Const PAGE_READWRITE          As Long = 4&
 Private Const FADF_AUTO               As Long = 1
 Private Const PAGE_EXECUTE_READWRITE  As Long = &H40&
+Private Const PROCESS_VM_READ         As Long = &H10
 
 Private Type UNICODE_STRING64
     Length                          As Integer
@@ -74,6 +75,13 @@ Private Type SAFEARRAY1D
     Bounds                          As SAFEARRAYBOUND
 End Type
 
+Private Declare Function OpenProcess Lib "kernel32" ( _
+                         ByVal dwDesiredAccess As Long, _
+                         ByVal bInheritHandle As Long, _
+                         ByVal dwProcessId As Long) As Long
+Private Declare Function GetCurrentProcessId Lib "kernel32" () As Long
+Private Declare Function CloseHandle Lib "kernel32" ( _
+                         ByVal hObject As Long) As Long
 Private Declare Function NtWow64QueryInformationProcess64 Lib "ntdll" ( _
                          ByVal hProcess As Long, _
                          ByVal ProcessInformationClass As Long, _
@@ -124,17 +132,27 @@ Private Declare Function lstrcmpi Lib "kernel32" _
                          Alias "lstrcmpiA" ( _
                          ByRef lpString1 As Any, _
                          ByRef lpString2 As Any) As Long
+Private Declare Function ArrPtr Lib "msvbvm60" _
+                         Alias "VarPtr" ( _
+                         ByRef psa() As Any) As Long
 Private Declare Sub MoveArray Lib "msvbvm60" _
                     Alias "__vbaAryMove" ( _
                     ByRef Destination() As Any, _
                     ByRef Source As Any)
                          
 Private m_pCodeBuffer   As Long
+Private m_hCurHandle    As Long
 
 ' // Initialize module
 Public Function Initialize() As Boolean
     
     If m_pCodeBuffer = 0 Then
+        
+        m_hCurHandle = OpenProcess(PROCESS_VM_READ, 0, GetCurrentProcessId())
+        
+        If m_hCurHandle = 0 Then
+            Exit Function
+        End If
         
         ' // Temporary buffer for caller
         ' // Be careful it doesn't support threading
@@ -142,6 +160,7 @@ Public Function Initialize() As Boolean
         m_pCodeBuffer = VirtualAlloc(0, 4096, MEM_COMMIT Or MEM_RESERVE, PAGE_EXECUTE_READWRITE)
         
         If m_pCodeBuffer = 0 Then
+            CloseHandle m_hCurHandle
             Exit Function
         End If
         
@@ -154,10 +173,12 @@ End Function
 ' // Uninitialize module
 Public Sub Uninitialize()
     
+    If m_hCurHandle Then
+        CloseHandle m_hCurHandle
+    End If
+    
     If m_pCodeBuffer Then
-        
         VirtualFree m_pCodeBuffer, 0, MEM_RELEASE
-        
     End If
     
 End Sub
@@ -308,8 +329,8 @@ Public Function CallX64( _
 
     hr = DispCallFunc(ByVal 0&, m_pCodeBuffer, 4, vbCurrency, 0, ByVal 0&, ByVal 0&, vRet)
 
-    GetMem4 0&, Not Not bCode
-    
+    GetMem4 0&, ByVal ArrPtr(bCode)
+
     If hr < 0 Then
         Err.Raise hr
         Exit Function
@@ -461,7 +482,7 @@ Public Sub ReadMem64( _
            ByVal lSize As Long)
     Dim lStatus As Long
     
-    lStatus = NtWow64ReadVirtualMemory64(-1, p64From, ByVal pTo, lSize / 10000, 0)
+    lStatus = NtWow64ReadVirtualMemory64(m_hCurHandle, p64From, ByVal pTo, lSize / 10000, 0)
 
     If lStatus < 0 Then
         Err.Raise lStatus
@@ -492,7 +513,7 @@ Private Function StringLen64( _
         ' // Read page
         ReDim Preserve bPage(lSize - 1)
         
-        lStatus = NtWow64ReadVirtualMemory64(-1, p64, bPage(0), lSize / 10000, 0)
+        lStatus = NtWow64ReadVirtualMemory64(m_hCurHandle, p64, bPage(0), lSize / 10000, 0)
         
         If lStatus < 0 Then
             Err.Raise lStatus
