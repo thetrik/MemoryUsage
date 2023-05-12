@@ -3,19 +3,32 @@ Attribute VB_Name = "modX64Call"
 ' //
 ' // modX64Call.bas
 ' // Module for calling functions in long-mode (x64)
-' // by The trick 2018 - 2020
+' // by The trick 2018 - 2023
+' // v.1.0.1
 ' //
 
 Option Explicit
 
-Private Const ProcessBasicInformation As Long = 0
-Private Const MEM_RESERVE             As Long = &H2000&
-Private Const MEM_COMMIT              As Long = &H1000&
-Private Const MEM_RELEASE             As Long = &H8000&
-Private Const PAGE_READWRITE          As Long = 4&
-Private Const FADF_AUTO               As Long = 1
-Private Const PAGE_EXECUTE_READWRITE  As Long = &H40&
-Private Const PROCESS_VM_READ         As Long = &H10
+Private Const ProcessBasicInformation         As Long = 0
+Private Const MEM_RESERVE                     As Long = &H2000&
+Private Const MEM_COMMIT                      As Long = &H1000&
+Private Const MEM_RELEASE                     As Long = &H8000&
+Private Const PAGE_READWRITE                  As Long = 4&
+Private Const PAGE_READONLY                   As Long = 2&
+Private Const PAGE_EXECUTE_READ               As Long = &H20&
+Private Const FADF_AUTO                       As Long = 1
+Private Const PAGE_EXECUTE_READWRITE          As Long = &H40&
+Private Const PROCESS_VM_READ                 As Long = &H10
+Private Const LOAD_LIBRARY_AS_IMAGE_RESOURCE  As Long = &H20
+Private Const OPEN_EXISTING                   As Long = 3
+Private Const GENERIC_READ                    As Long = &H80000000
+Private Const GENERIC_EXECUTE                 As Long = &H20000000
+Private Const SEC_IMAGE                       As Long = &H1000000
+Private Const FILE_ATTRIBUTE_NORMAL           As Long = &H80
+Private Const MAX_PATH                        As Long = 260
+Private Const INVALID_HANDLE_VALUE            As Long = -1
+Private Const FILE_MAP_READ                   As Long = 4
+Private Const FILE_MAP_EXECUTE                As Long = &H20
 
 Private Type UNICODE_STRING64
     Length                          As Integer
@@ -42,6 +55,16 @@ Private Type PROCESS_BASIC_INFORMATION64
     uInheritedFromUniqueProcessId   As Currency
 End Type
 
+Private Type IMAGE_FILE_HEADER
+    Machine                         As Integer
+    NumberOfSections                As Integer
+    TimeDateStamp                   As Long
+    PointerToSymbolTable            As Long
+    NumberOfSymbols                 As Long
+    SizeOfOptionalHeader            As Integer
+    Characteristics                 As Integer
+End Type
+
 Private Type IMAGE_DATA_DIRECTORY
     VirtualAddress                  As Long
     Size                            As Long
@@ -59,6 +82,19 @@ Private Type IMAGE_EXPORT_DIRECTORY
     AddressOfFunctions              As Long
     AddressOfNames                  As Long
     AddressOfNameOrdinals           As Long
+End Type
+
+Private Type IMAGE_SECTION_HEADER
+    SectionName(1)                  As Long
+    VirtualSize                     As Long
+    VirtualAddress                  As Long
+    SizeOfRawData                   As Long
+    PointerToRawData                As Long
+    PointerToRelocations            As Long
+    PointerToLinenumbers            As Long
+    NumberOfRelocations             As Integer
+    NumberOfLinenumbers             As Integer
+    Characteristics                 As Long
 End Type
 
 Private Type SAFEARRAYBOUND
@@ -100,6 +136,9 @@ Private Declare Function GetMem8 Lib "msvbvm60" ( _
 Private Declare Function GetMem4 Lib "msvbvm60" ( _
                          ByRef Src As Any, _
                          ByRef Dst As Any) As Long
+Private Declare Function PutMem4 Lib "msvbvm60" ( _
+                         ByRef pDst As Any, _
+                         ByVal lVal As Long) As Long
 Private Declare Function GetMem2 Lib "msvbvm60" ( _
                          ByRef Src As Any, _
                          ByRef Dst As Any) As Long
@@ -135,13 +174,57 @@ Private Declare Function lstrcmpi Lib "kernel32" _
 Private Declare Function ArrPtr Lib "msvbvm60" _
                          Alias "VarPtr" ( _
                          ByRef psa() As Any) As Long
+Private Declare Function Wow64DisableWow64FsRedirection Lib "kernel32" ( _
+                         ByRef lvalue As Long) As Long
+Private Declare Function Wow64RevertWow64FsRedirection Lib "kernel32" ( _
+                         ByVal lvalue As Long) As Long
+Private Declare Function CreateFile Lib "kernel32" _
+                         Alias "CreateFileW" ( _
+                         ByVal lpFileName As Long, _
+                         ByVal dwDesiredAccess As Long, _
+                         ByVal dwShareMode As Long, _
+                         ByRef lpSecurityAttributes As Any, _
+                         ByVal dwCreationDisposition As Long, _
+                         ByVal dwFlagsAndAttributes As Long, _
+                         ByVal hTemplateFile As Long) As Long
+Private Declare Function GetSystemDirectory Lib "kernel32" _
+                         Alias "GetSystemDirectoryW" ( _
+                         ByVal lpBuffer As Long, _
+                         ByVal nSize As Long) As Long
+Private Declare Function CreateFileMapping Lib "kernel32" _
+                         Alias "CreateFileMappingW" ( _
+                         ByVal hFile As Long, _
+                         ByRef lpFileMappingAttributes As Any, _
+                         ByVal flProtect As Long, _
+                         ByVal dwMaximumSizeHigh As Long, _
+                         ByVal dwMaximumSizeLow As Long, _
+                         ByVal lpName As Long) As Long
+Private Declare Function MapViewOfFile Lib "kernel32" ( _
+                         ByVal hFileMappingObject As Long, _
+                         ByVal dwDesiredAccess As Long, _
+                         ByVal dwFileOffsetHigh As Long, _
+                         ByVal dwFileOffsetLow As Long, _
+                         ByVal dwNumberOfBytesToMap As Long) As Long
+Private Declare Function UnmapViewOfFile Lib "kernel32" ( _
+                         ByVal lpBaseAddress As Long) As Long
+Private Declare Function StrCmpCA Lib "shlwapi" ( _
+                         ByRef lpString1 As Any, _
+                         ByRef lpString2 As Any) As Long
+                         
+Private Declare Sub memcpy Lib "kernel32" _
+                    Alias "RtlMoveMemory" ( _
+                    ByRef Destination As Any, _
+                    ByRef Source As Any, _
+                    ByVal Length As Long)
 Private Declare Sub MoveArray Lib "msvbvm60" _
                     Alias "__vbaAryMove" ( _
                     ByRef Destination() As Any, _
                     ByRef Source As Any)
                          
-Private m_pCodeBuffer   As Long
-Private m_hCurHandle    As Long
+Private m_pCodeBuffer           As Long
+Private m_hCurHandle            As Long
+Private m_hUser32               As OLE_HANDLE
+Private m_pfnZwUserMessageCall  As Long
 
 ' // Initialize module
 Public Function Initialize() As Boolean
@@ -172,6 +255,10 @@ End Function
 
 ' // Uninitialize module
 Public Sub Uninitialize()
+    
+    If m_hUser32 Then
+        UnmapViewOfFile m_hUser32
+    End If
     
     If m_hCurHandle Then
         CloseHandle m_hCurHandle
@@ -229,6 +316,7 @@ Public Function CallX64( _
     
     ' // PUSH RBX
     ' // MOV RBX, SS
+    ' // XCHG RSP, R14
     ' // PUSH RBP
     ' // MOV RBP, RSP
     ' // AND ESP, 0xFFFFFFF0
@@ -242,9 +330,11 @@ Public Function CallX64( _
     
     lArgs = lArgs * 8 + &H20
     
-    GetMem8 -140194732553717.1373@, bCode(lByteIdx):    lByteIdx = lByteIdx + 8
-    GetMem8 26004001868.3011@, bCode(lByteIdx):         lByteIdx = lByteIdx + 6
-    GetMem4 lArgs, bCode(lByteIdx):                     lByteIdx = lByteIdx + 4
+    GetMem8 619372415157772.5011@, bCode(lByteIdx): lByteIdx = lByteIdx + 8
+    GetMem8 -425235570199.468@, bCode(lByteIdx):    lByteIdx = lByteIdx + 8
+    GetMem4 &H8148FFFF, bCode(lByteIdx):            lByteIdx = lByteIdx + 4
+    bCode(lByteIdx) = &HEC:                         lByteIdx = lByteIdx + 1
+    GetMem4 lArgs, bCode(lByteIdx):                 lByteIdx = lByteIdx + 4
     
     For Each vArg In vArgs
         
@@ -307,9 +397,10 @@ Public Function CallX64( _
     GetMem2 &HD0FF&, bCode(lByteIdx):   lByteIdx = lByteIdx + 2
     
     ' // LEAVE
+    ' // XCHG RSP, R14
     ' // MOV SS, RBX
     ' // POP RBX
-    GetMem8 39439134.1257@, bCode(lByteIdx):  lByteIdx = lByteIdx + 5
+    GetMem8 661678872152868.7817@, bCode(lByteIdx): lByteIdx = lByteIdx + 8
     
     ' // RAX to EAX/EDX pair
     ' // MOV RDX, RAX
@@ -491,6 +582,268 @@ Public Sub ReadMem64( _
  
 End Sub
 
+' // Send message and return 64 bit result
+Public Function SendMessageW64( _
+                ByVal hwnd As OLE_HANDLE, _
+                ByVal lMsg As Long, _
+                ByVal p64wParam As Currency, _
+                ByVal p64lParam As Currency) As Currency
+    Dim hr          As Long
+    Dim lFID        As Long
+    Dim p64Result   As Currency
+    Dim p64Fn       As Currency
+    
+    If m_pfnZwUserMessageCall = 0 Then
+    
+        hr = GetZwUserMessageCallAddress(m_pfnZwUserMessageCall, m_hUser32)
+        
+        If hr < 0 Then
+            Err.Raise hr
+        End If
+        
+    End If
+    
+    PutMem4 p64Fn, m_pfnZwUserMessageCall
+
+    SendMessageW64 = CallX64(p64Fn, hwnd, lMsg, p64wParam, p64lParam, 0&, &H2B1, 0&)
+    
+End Function
+
+Private Function GetZwUserMessageCallAddress( _
+                 ByRef pfnRet As Long, _
+                 ByRef hLib As OLE_HANDLE) As Long
+    Dim hModule As OLE_HANDLE
+    Dim hr      As Long
+    Dim pfn     As Long
+    
+    hr = MapModule("win32u.dll", hModule)
+    
+    If hr < 0 Then
+            
+        hr = MapModule("user32.dll", hModule)
+        
+        If hr < 0 Then
+            GetZwUserMessageCallAddress = hr
+            Exit Function
+        End If
+        
+        pfn = SearchExportInLib64(hModule, "gapfnScSendMessage")
+        
+        If pfn = 0 Then
+            hr = &H8007007F
+            GoTo CleanUp
+        End If
+        
+        pfn = ZwUserMessageCallAddressFromgapfnScSendMessage(hModule, pfn)
+        
+    Else
+        pfn = SearchExportInLib64(hModule, "NtUserMessageCall")
+    End If
+
+    If pfn = 0 Then
+        hr = &H8007007F
+        GoTo CleanUp
+    End If
+         
+    pfnRet = pfn
+    hLib = hModule
+    
+CleanUp:
+    
+    If hr < 0 Then
+        
+        If hModule Then
+            UnmapViewOfFile hModule
+        End If
+
+    End If
+        
+    GetZwUserMessageCallAddress = hr
+        
+End Function
+
+Private Function ZwUserMessageCallAddressFromgapfnScSendMessage( _
+                 ByVal hUser32 As Long, _
+                 ByVal pfn As Long) As Long
+    Dim p64Offset       As Currency
+    Dim p64Base         As Currency
+    Dim lRvaNtHeaders   As Long
+    Dim lRVAFunc        As Long
+    Dim tFileHdr        As IMAGE_FILE_HEADER
+    Dim tSections()     As IMAGE_SECTION_HEADER
+    Dim pAddress        As Long
+    
+    GetMem4 ByVal hUser32 + &H3C, lRvaNtHeaders
+    GetMem8 ByVal lRvaNtHeaders + hUser32 + &H30, p64Base
+    GetMem8 ByVal pfn, p64Offset
+    GetMem4 p64Offset - p64Base, lRVAFunc
+    
+    memcpy tFileHdr, ByVal hUser32 + lRvaNtHeaders + 4, Len(tFileHdr)
+    
+    ReDim tSections(tFileHdr.NumberOfSections - 1)
+    
+    memcpy tSections(0), ByVal hUser32 + lRvaNtHeaders + &H108, Len(tSections(0)) * tFileHdr.NumberOfSections
+    
+    ZwUserMessageCallAddressFromgapfnScSendMessage = Rva2Raw(tSections(), lRVAFunc) + hUser32
+    
+End Function
+
+Private Function SearchExportInLib64( _
+                 ByVal hLib As OLE_HANDLE, _
+                 ByRef sName As String) As Long
+    Dim lRvaNtHeaders       As Long
+    Dim tFileHdr            As IMAGE_FILE_HEADER
+    Dim tExportDir          As IMAGE_DATA_DIRECTORY
+    Dim tSections()         As IMAGE_SECTION_HEADER
+    Dim tExportDirectory    As IMAGE_EXPORT_DIRECTORY
+    Dim lI                  As Long
+    Dim lJ                  As Long
+    Dim pNames              As Long
+    Dim pFunctionName       As Long
+    Dim sNameANSI           As String
+    Dim lOrdinal            As Long
+    Dim lFnRVA              As Long
+    
+    sNameANSI = StrConv(sName, vbFromUnicode)
+    
+    GetMem4 ByVal hLib + &H3C, lRvaNtHeaders
+    
+    memcpy tFileHdr, ByVal hLib + lRvaNtHeaders + 4, Len(tFileHdr)
+    memcpy tExportDir, ByVal hLib + lRvaNtHeaders + 136, Len(tExportDir)
+    
+    If tExportDir.Size <= 0 Or tExportDir.VirtualAddress <= 0 Then
+        Exit Function
+    End If
+    
+    ReDim tSections(tFileHdr.NumberOfSections - 1)
+    
+    memcpy tSections(0), ByVal hLib + lRvaNtHeaders + &H108, Len(tSections(0)) * tFileHdr.NumberOfSections
+    memcpy tExportDirectory, ByVal hLib + Rva2Raw(tSections(), tExportDir.VirtualAddress), Len(tExportDirectory)
+        
+    pNames = Rva2Raw(tSections(), tExportDirectory.AddressOfNames) + hLib
+        
+    Do
+        
+        lI = tExportDirectory.NumberOfNames \ 2
+            
+        GetMem4 ByVal pNames + (lI + lJ) * 4, pFunctionName
+        pFunctionName = Rva2Raw(tSections(), pFunctionName) + hLib
+        
+        Select Case StrCmpCA(ByVal StrPtr(sNameANSI), ByVal pFunctionName)
+        Case 0
+            
+            GetMem2 ByVal Rva2Raw(tSections(), tExportDirectory.AddressOfNameOrdinals) + hLib + (lI + lJ) * 2, lOrdinal
+            GetMem4 ByVal Rva2Raw(tSections(), tExportDirectory.AddressOfFunctions) + hLib + lOrdinal * 4, lFnRVA
+            
+            If lFnRVA < tExportDir.VirtualAddress Or lFnRVA >= tExportDir.VirtualAddress + tExportDir.Size Then
+                SearchExportInLib64 = Rva2Raw(tSections(), lFnRVA) + hLib
+            End If
+            
+            Exit Function
+            
+        Case Is > 0
+            tExportDirectory.NumberOfNames = tExportDirectory.NumberOfNames - lI
+            lJ = lJ + lI
+        Case Else
+            tExportDirectory.NumberOfNames = tExportDirectory.NumberOfNames - lI
+        End Select
+        
+    Loop While lI
+
+End Function
+
+Private Function Rva2Raw( _
+                 ByRef tSections() As IMAGE_SECTION_HEADER, _
+                 ByVal lRVA As Long) As Long
+    Dim lIndex  As Long
+    
+    For lIndex = 0 To UBound(tSections)
+        If lRVA >= tSections(lIndex).VirtualAddress And lRVA < tSections(lIndex).VirtualAddress + tSections(lIndex).VirtualSize Then
+            Rva2Raw = tSections(lIndex).PointerToRawData + (lRVA - tSections(lIndex).VirtualAddress)
+            Exit Function
+        End If
+    Next
+    
+    Rva2Raw = lRVA
+    
+End Function
+
+Private Function MapModule( _
+                 ByRef sName As String, _
+                 ByRef hResult As OLE_HANDLE) As Long
+    Dim hMap            As OLE_HANDLE
+    Dim hFile           As OLE_HANDLE
+    Dim sSysPath        As String
+    Dim lSize           As Long
+    Dim pAddress        As OLE_HANDLE
+    Dim hr              As Long
+    Dim lRvaNtHeaders   As Long
+    Dim lMachine        As Long
+    Dim lFSRedirect     As Long
+    
+    sSysPath = Space$(MAX_PATH)
+    lSize = GetSystemDirectory(StrPtr(sSysPath), Len(sSysPath) + 1)
+    sSysPath = Left$(sSysPath, lSize)
+    
+    If Wow64DisableWow64FsRedirection(lFSRedirect) = 0 Then
+        MapModule = &H80070000 Or (Err.LastDllError And &HFFFF&)
+        Exit Function
+    End If
+    
+    hFile = CreateFile(StrPtr(sSysPath & "\" & sName), GENERIC_READ Or GENERIC_EXECUTE, 5, ByVal 0&, OPEN_EXISTING, 0, 0)
+    
+    Wow64RevertWow64FsRedirection lFSRedirect
+    
+    If hFile = INVALID_HANDLE_VALUE Then
+        MapModule = &H80070000 Or (Err.LastDllError And &HFFFF&)
+        Exit Function
+    End If
+    
+    hMap = CreateFileMapping(hFile, ByVal 0&, PAGE_EXECUTE_READ, 0, 0, 0)
+    
+    If hMap = 0 Then
+        hr = &H80070000 Or (Err.LastDllError And &HFFFF&)
+        GoTo CleanUp
+    End If
+    
+    pAddress = MapViewOfFile(hMap, FILE_MAP_READ Or FILE_MAP_EXECUTE, 0, 0, 0)
+    
+    If pAddress = 0 Then
+        hr = &H80070000 Or (Err.LastDllError And &HFFFF&)
+        GoTo CleanUp
+    End If
+    
+    GetMem4 ByVal pAddress + &H3C, lRvaNtHeaders
+    GetMem2 ByVal pAddress + lRvaNtHeaders + 4, lMachine
+    
+    If lMachine <> &H8664& Then
+        hr = &H8000FFFF
+        GoTo CleanUp
+    End If
+    
+CleanUp:
+    
+    If hMap Then
+        CloseHandle hMap
+    End If
+    
+    If hFile Then
+        CloseHandle hFile
+    End If
+    
+    If hr < 0 Then
+        If pAddress Then
+            UnmapViewOfFile pAddress
+        End If
+    Else
+        hResult = pAddress
+    End If
+    
+    MapModule = hr
+    
+End Function
+
+' // Get SendMessage address
 ' // Get null-terminated string length
 Private Function StringLen64( _
                  ByVal p64 As Currency) As Currency
@@ -600,4 +953,6 @@ Private Function CompareUnicodeStrings64( _
     End If
     
 End Function
+
+
 
