@@ -29,6 +29,7 @@ Private Const MAX_PATH                        As Long = 260
 Private Const INVALID_HANDLE_VALUE            As Long = -1
 Private Const FILE_MAP_READ                   As Long = 4
 Private Const FILE_MAP_EXECUTE                As Long = &H20
+Private Const PROCESSOR_ARCHITECTURE_AMD64    As Long = 9
 
 Private Type UNICODE_STRING64
     Length                          As Integer
@@ -111,6 +112,46 @@ Private Type SAFEARRAY1D
     Bounds                          As SAFEARRAYBOUND
 End Type
 
+Private Type OSVERSIONINFO
+    dwOSVersionInfoSize             As Long
+    dwMajorVersion                  As Long
+    dwMinorVersion                  As Long
+    dwBuildNumber                   As Long
+    dwPlatformId                    As Long
+    szCSDVersion                    As String * 128
+End Type
+
+Private Type VS_FIXEDFILEINFO
+    dwSignature                     As Long
+    dwStrucVersion                  As Long
+    dwFileVersionMS                 As Long
+    dwFileVersionLS                 As Long
+    dwProductVersionMS              As Long
+    dwProductVersionLS              As Long
+    dwFileFlagsMask                 As Long
+    dwFileFlags                     As Long
+    dwFileOS                        As Long
+    dwFileType                      As Long
+    dwFileSubtype                   As Long
+    dwFileDateMS                    As Long
+    dwFileDateLS                    As Long
+End Type
+
+Private Type SYSTEM_INFO
+    wProcessorArchitecture          As Integer
+    wReserved                       As Integer
+    dwPageSize                      As Long
+    lpMinimumApplicationAddress     As Long
+    lpMaximumApplicationAddress     As Long
+    dwActiveProcessorMask           As Long
+    dwNumberOrfProcessors           As Long
+    dwProcessorType                 As Long
+    dwAllocationGranularity         As Long
+    dwReserved                      As Long
+End Type
+
+Private Declare Sub GetNativeSystemInfo Lib "kernel32" ( _
+                    ByRef lpSystemInfo As SYSTEM_INFO)
 Private Declare Function OpenProcess Lib "kernel32" ( _
                          ByVal dwDesiredAccess As Long, _
                          ByVal bInheritHandle As Long, _
@@ -210,6 +251,24 @@ Private Declare Function UnmapViewOfFile Lib "kernel32" ( _
 Private Declare Function StrCmpCA Lib "shlwapi" ( _
                          ByRef lpString1 As Any, _
                          ByRef lpString2 As Any) As Long
+Private Declare Function RtlGetVersion Lib "ntdll" ( _
+                         ByRef pVersion As Any) As Long
+Private Declare Function GetFileVersionInfoSize Lib "version.dll" _
+                         Alias "GetFileVersionInfoSizeW" ( _
+                         ByVal lptstrFilename As Long, _
+                         ByRef lpdwHandle As Long) As Long
+Private Declare Function GetFileVersionInfo Lib "version.dll" _
+                         Alias "GetFileVersionInfoW" ( _
+                         ByVal lptstrFilename As Long, _
+                         ByVal dwHandle As Long, _
+                         ByVal dwLen As Long, _
+                         ByRef lpData As Any) As Long
+Private Declare Function VerQueryValue Lib "version.dll" _
+                         Alias "VerQueryValueW" ( _
+                         ByRef pBlock As Any, _
+                         ByVal lpSubBlock As Long, _
+                         ByRef lpBuffer As Any, _
+                         ByRef puLen As Long) As Long
                          
 Private Declare Sub memcpy Lib "kernel32" _
                     Alias "RtlMoveMemory" ( _
@@ -225,11 +284,53 @@ Private m_pCodeBuffer           As Long
 Private m_hCurHandle            As Long
 Private m_hUser32               As OLE_HANDLE
 Private m_pfnZwUserMessageCall  As Long
+Private m_bWin8AndAbove         As Boolean
 
 ' // Initialize module
 Public Function Initialize() As Boolean
+    Dim hWow64CPU   As OLE_HANDLE
+    Dim lFSRedirect As Long
+    Dim lResSize    As Long
+    Dim bVersion()  As Byte
+    Dim pFixVer     As Long
+    Dim lFixLen     As Long
+    Dim tFixVer     As VS_FIXEDFILEINFO
+    Dim tSysInfo    As SYSTEM_INFO
+    
+    GetNativeSystemInfo tSysInfo
+    
+    If tSysInfo.wProcessorArchitecture <> PROCESSOR_ARCHITECTURE_AMD64 Then
+        Exit Function
+    End If
     
     If m_pCodeBuffer = 0 Then
+        
+        If Wow64DisableWow64FsRedirection(lFSRedirect) = 0 Then
+            Exit Function
+        End If
+    
+        lResSize = GetFileVersionInfoSize(StrPtr("wow64cpu.dll"), 0)
+        
+        If lResSize > 0 Then
+            
+            ReDim bVersion(lResSize - 1)
+            lResSize = GetFileVersionInfo(StrPtr("wow64cpu.dll"), 0, lResSize, bVersion(0))
+            
+        End If
+
+        Wow64RevertWow64FsRedirection lFSRedirect
+        
+        If lResSize = 0 Then
+            Exit Function
+        End If
+        
+        If VerQueryValue(bVersion(0), StrPtr("\"), pFixVer, lFixLen) = 0 Then
+            Exit Function
+        End If
+
+        memcpy tFixVer, ByVal pFixVer, Len(tFixVer)
+        
+        m_bWin8AndAbove = tFixVer.dwFileVersionMS >= &H60002
         
         m_hCurHandle = OpenProcess(PROCESS_VM_READ, 0, GetCurrentProcessId())
         
@@ -316,7 +417,15 @@ Public Function CallX64( _
     
     ' // PUSH RBX
     ' // MOV RBX, SS
+    
+    ' // --- win7 and below ---
+    
+    ' // MOV [R12 + 0x1480], R14 ; TlsSlot for stack (R12 - TEB64)
+    
+    ' // ----------------------
+    
     ' // XCHG RSP, R14
+    ' // MOV [R13 + STACK_PTR], R14
     ' // PUSH RBP
     ' // MOV RBP, RSP
     ' // AND ESP, 0xFFFFFFF0
@@ -330,12 +439,24 @@ Public Function CallX64( _
     
     lArgs = lArgs * 8 + &H20
     
-    GetMem8 619372415157772.5011@, bCode(lByteIdx): lByteIdx = lByteIdx + 8
-    GetMem8 -425235570199.468@, bCode(lByteIdx):    lByteIdx = lByteIdx + 8
-    GetMem4 &H8148FFFF, bCode(lByteIdx):            lByteIdx = lByteIdx + 4
-    bCode(lByteIdx) = &HEC:                         lByteIdx = lByteIdx + 1
-    GetMem4 lArgs, bCode(lByteIdx):                 lByteIdx = lByteIdx + 4
+    PutMem4 bCode(lByteIdx), &HD38C4853:                lByteIdx = lByteIdx + 4
     
+    If Not m_bWin8AndAbove Then
+        GetMem8 2254060418.0813@, bCode(lByteIdx):      lByteIdx = lByteIdx + 8
+    End If
+    
+    GetMem8 19960132210.0553@, bCode(lByteIdx):         lByteIdx = lByteIdx + 8
+    GetMem8 -198047932815474.688@, bCode(lByteIdx):     lByteIdx = lByteIdx + 8
+    
+    If m_bWin8AndAbove Then
+        GetMem4 &H48&, bCode(lByteIdx - 10)
+    Else
+        GetMem4 &HC8&, bCode(lByteIdx - 10)
+    End If
+    
+    PutMem4 bCode(lByteIdx), &HEC8148F0:                lByteIdx = lByteIdx + 4
+    GetMem4 lArgs, bCode(lByteIdx):                     lByteIdx = lByteIdx + 4
+
     For Each vArg In vArgs
         
         Select Case VarType(vArg)
@@ -953,6 +1074,4 @@ Private Function CompareUnicodeStrings64( _
     End If
     
 End Function
-
-
 
